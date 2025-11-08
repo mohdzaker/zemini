@@ -1,6 +1,6 @@
 "use server";
 
-import axios from "axios";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import cloudinary from "cloudinary";
 import fs from "fs/promises";
 import path from "path";
@@ -14,8 +14,10 @@ cloudinary.v2.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
 /**
- * Generate or transform an image using Zemini Cloudflare Worker
+ * Generate an image using Google Gemini API
  * @param {string} prompt - The text prompt for AI generation
  * @param {string} [type="generate"] - Type of generation ("generate" | "ghibli" | "img2img")
  * @param {string} [imageUrl] - Optional image URL (for Ghibli transformation)
@@ -24,42 +26,54 @@ export default async function generateImage(prompt, type = "generate", imageUrl 
   try {
     await connectToDB();
 
-    console.log(`🚀 Generating (${type}) image for prompt:`, prompt);
+    console.log(`Generating (${type}) image for prompt:`, prompt);
 
-    // ✅ Call your Cloudflare Worker API
-    const response = await axios.post(
-      "https://zemini.mohammadzaker245.workers.dev",
-      { prompt, type, imageUrl },
-      {
-        headers: {
-          Authorization: "Bearer zeminiimagegenerator",
-          "Content-Type": "application/json",
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
+
+    const result = await model.generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: prompt,
+            },
+          ],
         },
-        responseType: "arraybuffer",
-      }
-    );
+      ],
+      generationConfig: {
+        temperature: 1,
+        topP: 0.95,
+        topK: 40,
+        maxOutputTokens: 8192,
+        responseMimeType: "image/jpeg",
+      },
+    });
 
-    // ✅ Save image temporarily
+    const imageData = result.response.candidates[0].content.parts[0].inlineData;
+
+    if (!imageData || !imageData.data) {
+      throw new Error("No image data returned from Gemini API");
+    }
+
+    const imageBuffer = Buffer.from(imageData.data, "base64");
+
     const tempDir = path.join(process.cwd(), "tmp");
     await fs.mkdir(tempDir, { recursive: true });
 
-    const tempPath = path.join(tempDir, `image_${Date.now()}.png`);
-    await fs.writeFile(tempPath, response.data);
+    const tempPath = path.join(tempDir, `image_${Date.now()}.jpg`);
+    await fs.writeFile(tempPath, imageBuffer);
 
-    // ✅ Upload to Cloudinary
     const upload = await cloudinary.v2.uploader.upload(tempPath, {
       folder: "zemini/generated",
       resource_type: "image",
     });
 
-    // ✅ Clean up temp file
     await fs.unlink(tempPath);
 
-    // ✅ Get session user
     const session = await getServerSession();
     const userEmail = session?.user?.email || "guest";
 
-    // ✅ Save in MongoDB
     const newImage = await Image.create({
       userEmail,
       prompt,
@@ -67,20 +81,19 @@ export default async function generateImage(prompt, type = "generate", imageUrl 
       type,
     });
 
-    console.log("✅ Image saved & uploaded successfully:", upload.secure_url);
+    console.log("Image saved & uploaded successfully:", upload.secure_url);
 
-    // ✅ Return clean response
     return {
       status: "success",
       imageUrl: upload.secure_url,
       message:
         type === "ghibli"
-          ? "Ghibli-style image generated successfully 🎨✨"
-          : "Image generated successfully 🎨",
+          ? "Ghibli-style image generated successfully"
+          : "Image generated successfully",
       data: JSON.parse(JSON.stringify(newImage)),
     };
   } catch (error) {
-    console.error("❌ AI Image Generation Error:", error?.response?.data || error);
+    console.error("AI Image Generation Error:", error?.response?.data || error);
     return {
       status: "failed",
       message: error?.message || "Something went wrong while generating the image.",
